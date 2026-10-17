@@ -26,6 +26,10 @@ socket, so the engine can run inside an application written in any language.
 It adds a house to trade against, tells both sides of every trade, and keeps
 statistics on how it performed.
 
+`hftbt` backtests a strategy on tick data through the same order book, and
+validates it out of sample against a coin-toss baseline before saying whether
+it has an edge. The market maker it comes with does not.
+
 ## Design
 
 | Piece | File | What it does |
@@ -541,6 +545,121 @@ Things to know:
 - **Statistics are per session** and measured inside HFT: the time a message
   spends in the socket on its way in and out is not in them.
 
+## Backtesting a strategy: HFT Strategy
+
+A fast order book is only the first piece of high-frequency trading. The rest
+is a strategy, and an honest way to find out whether it makes money before it
+goes near a market. [backtest/](backtest/) has both:
+
+- **Tick data.** Gomer Trading's practice market, regenerated tick for tick
+  exactly as the app makes it (checked against the app's own code to 1e-9),
+  or a recording of an HFT session turned into ticks. Stored, if wanted, in a
+  compact file of about 8 bytes an event.
+- **A tick-level backtester.** The ticks are replayed through a real
+  `lob::OrderBook` for each symbol, with the market's own liquidity resting in
+  it as orders and the strategy's orders joining the queue behind them. It
+  keeps the strategy's place in the queue as orders ahead are cancelled,
+  delays market data, orders and cancels, fills in part, charges commission,
+  and fills a resting order at its own price when the market moves through it.
+  The same input gives the same result every time.
+- **HFT Strategy**, a market maker. It reads order-book imbalance over the top
+  five levels, the micro-price, trade-flow toxicity and, optionally, a short
+  trend. It joins the best bid or offer only when they point to a quick fill,
+  takes profit one or two ticks away, has a time stop, gets out at once if the
+  signal turns, holds strict position limits, limits its order rate, and has a
+  kill switch per session and per run. Every setting is in one file,
+  [backtest/hft_strategy.ini](backtest/hft_strategy.ini).
+- **Validation.** Walk-forward tuning and testing, a holdout nothing was tuned
+  on, a coin-toss baseline, overfitting checks, sensitivity, stress tests, and
+  a check of whether the signals predict the price at all. It ends in a plain
+  verdict.
+
+### The result
+
+On 26 days of Gomer Trading's practice market, a little over a million ticks
+for 10 symbols ([reports/validation.md](reports/validation.md)):
+
+| | Success rate | Profit per trade | Net |
+|---|---|---|---|
+| Out of sample: 8 walk-forward test windows, 16 days | **30.1% (589 of 1,958 trades)** | -$4.12 | -$8,066 |
+| Holdout: the last 6 days, never looked at while tuning | **28.6% (255 of 893 trades)** | -$3.41 | -$3,043 |
+| Coin-toss entries, same exits, same 16 days | 28.9% (664 of 2,297 trades) | -$3.52 | -$8,090 |
+
+**Verdict: no edge.** The strategy loses money on every stretch of days it was
+not tuned on, and it does no better than choosing its side by a coin toss. The
+reason is in the signal check. In the practice market, the sizes on the book
+and the trade prints are random decoration: their correlation with the next
+second's price move is 0.000. A resting order is filled only when the price
+moves through it, so every fill comes just as the price moves against it, by
+2 to 3.5 cents a share within a few seconds. The only signal with anything in
+it is the trend, at 0.013. Weighting it in makes the loss smaller, but it is
+still a loss.
+
+None of this says anything about a real market, where order books do carry
+information. It says the backtester does not flatter: a strategy has to beat
+this test before it is worth running anywhere.
+
+### Using it
+
+```bash
+./build/hftbt run      --config backtest/hft_strategy.ini                     # one day
+./build/hftbt run      --config backtest/hft_strategy.ini --set market.sessions=5 --set strategy.enter_score=0.8
+./build/hftbt validate --config backtest/hft_strategy.ini --out reports       # 5 to 10 minutes on 16 cores
+./build/hftbt generate --config backtest/hft_strategy.ini --out day.lobt      # the market as a tick file
+./build/hftbt import-hft "$HOME/Library/Application Support/Gomer Trading/hft/hft-session-....rec" --out live.lobt
+./build/hftbt run      --set market.ticks=live.lobt                           # replay a recorded day
+./build/hftbt info     live.lobt
+```
+
+Every report leads with the success rate, as "X% (N of M trades)", with the
+range the true rate is likely in. It then gives net profit, profit per trade
+with its t-statistic, the worst trade, the largest drawdown, the fill rate and
+adverse selection. A setting the program does not know stops the run, so a
+typo cannot quietly turn off a risk limit.
+
+Nothing is stored unless asked for. A validation keeps its whole market in
+memory and writes only its report, about 33 KB. A day of the practice market
+as a tick file is about 7 MB for 10 symbols.
+
+### How the backtester decides fills
+
+- The market's liquidity is "the house": its best bid and offer at the sizes
+  the quote shows, and the depth model's levels behind them, as orders in the
+  book. When the quote changes, everything that has to go goes before anything
+  is added, so a new bid never meets a stale offer.
+- When the size at the strategy's price shrinks without a trade, `queue` says
+  how much of the shrinking was ahead of it: in proportion (`prorata`), none
+  (`back`, pessimistic) or all (`front`, optimistic).
+- When the market moves through a resting order, the order fills at its own
+  price. This is how Gomer Trading's practice market fills resting orders, and
+  the only way: its trade prints never fill anything, unless `print_fills` is
+  turned on to try the other regime.
+- The strategy's own trades move the practice market's prices, as they do in
+  the app, unless `impact` is off.
+- At the end of a day, open orders are cancelled and anything still held is
+  closed at the touch, and counted as a trade like any other.
+
+### How validation works
+
+1. Every combination of the `[validation]` grid runs over one stream of days.
+2. **Walk-forward.** Pick the combination that made the most over 4 days, test
+   it on the next 2, move on 2 days and repeat. The test windows together are
+   the out-of-sample result.
+3. **Holdout.** The best combination over all 20 walk-forward days is tested
+   once on the 6 days after them.
+4. **Baseline.** The same settings with the entry chosen by a coin toss. A
+   signal worth having beats it.
+5. **Overfitting.** In-sample against out-of-sample, the rank correlation of
+   training and test results (0.12 here: training says almost nothing about
+   the test), and how often the training winner comes in below the median.
+6. **Sensitivity.** Each setting halved and raised by half.
+7. **Stress.** 5, 50 and 500 times the delays, commission of $0.001, $0.0035
+   and $0.005 a share, the back of the queue, prints that fill, and no impact.
+8. **The verdict.** An edge needs at least 30 trades in each test, profit out
+   of sample and in the holdout with t of 2 or more, a clear win over the
+   baseline, and survival of 5 times the delays and $0.001 commission.
+   Anything less is reported as no edge, with the reasons.
+
 ## Build
 
 Dependencies on Ubuntu or WSL:
@@ -606,6 +725,9 @@ is in [.github/workflows/ci.yml](.github/workflows/ci.yml).
 | [tests/market_data_test.cpp](tests/market_data_test.cpp) | Which messages each kind of command produces, snapshots, a slow reader recovering from dropped messages, 6,000 random commands with a mirror checked against the book after every one, and mirrors checked against the books after random traffic and moves across three shard threads. |
 | [tests/replay_test.cpp](tests/replay_test.cpp) | Recording: every command in order, none lost when the writer falls behind, none recorded that the engine refused, files that are cut short, damaged or not recordings at all. Replaying: random sessions of 20,000 commands on a running engine, and on four shards with dozens of moves, reproduced event for event, message for message and order for order on engines of other shapes; stopping part-way; and a recorded replay giving the same file byte for byte. |
 | [tests/hft_test.cpp](tests/hft_test.cpp) | HFT through the messages a client sends: orders, fills told to both sides, cancels, the house following its quotes and never trading with itself, depth, sessions, statistics, the recording cap and the replay check; 30,000 random messages with a client that keeps its own books from what it is told and must end with nothing unaccounted for; and a server on a real socket handling split and batched messages, a client that leaves and returns, and nonsense. [hft/node/smoke.mjs](hft/node/smoke.mjs) drives the built program from Node.js. |
+| [tests/backtest_market_test.cpp](tests/backtest_market_test.cpp) | The practice market against numbers taken from Gomer Trading's own code: prices, random draws and depth books; tick files written, read back, cut short and damaged. |
+| [tests/backtest_sim_test.cpp](tests/backtest_sim_test.cpp) | The backtester's exchange, scenario by scenario with answers worked out by hand: queue position under each model, delays, partial fills, cancels racing fills, being traded through, prints, commission, round trips, drawdown and adverse selection, and the same input giving the same result. |
+| [tests/backtest_strategy_test.cpp](tests/backtest_strategy_test.cpp) | HFT Strategy rule by rule (entries each way, target, time stop, scratch, withdrawals, toxicity, limits, rate limit, both kill switches, the coin-toss baseline); the signal check; the settings file and its errors; the report's numbers; validation from start to verdict, the same on one thread as on three; and an HFT recording imported as ticks. A ctest also runs `hftbt validate` from the shipped settings file. |
 | [tests/rebalance_test.cpp](tests/rebalance_test.cpp) | The rebalancing decision on its own, including 300 random cases showing that repeated moves only ever improve things and always stop; and the engine moving a busy symbol off an overloaded shard, settling, following a shift in traffic, and doing it all unprompted. |
 | [tests/order_type_test.cpp](tests/order_type_test.cpp) | Market, IOC and FOK orders: what trades, what is discarded, and that they work when the book is full. |
 | [tests/thread_affinity_test.cpp](tests/thread_affinity_test.cpp) | Pinning requests that succeed, fail and are impossible; the engine runs in every case. |
@@ -746,6 +868,7 @@ machine is; run them on the hardware you care about.
 - [x] Phase 17 — A market data feed: best prices, depth and trades
 - [x] Phase 18 — Recording a session to a file and replaying it exactly
 - [x] Phase 19 — HFT: the engine as a program, with a socket, a house, statistics and a Node.js client
+- [x] Phase 20 — HFT Strategy: tick data, a tick-level backtester on the order book, a market maker, and validation
 - [ ] Next — Saving the books part-way through, so that a replay need not start from the beginning
 
 ## Layout
@@ -753,6 +876,8 @@ machine is; run them on the hardware you care about.
 ```
 include/lob/   header-only engine
 hft/           HFT: the engine as a program, and its Node.js client
+backtest/      tick data, the backtester, HFT Strategy, validation, and hftbt
+reports/       the latest validation report
 tests/         GoogleTest suite
 bench/         Google Benchmark suite
 ```

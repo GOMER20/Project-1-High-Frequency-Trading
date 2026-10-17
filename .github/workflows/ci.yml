@@ -100,3 +100,16 @@ jobs:
       - name: Run HFT on a simulated market
         timeout-minutes: 5
         run: ./build/hft simulate --messages 200000 --symbols 8 --data "$RUNNER_TEMP"
+
+      # HFT Strategy on one short practice-market session, and an HFT
+      # recording turned into tick data: the backtester's own programs, start
+      # to finish. (The test step above already ran a short validation.)
+      - name: Backtest HFT Strategy
+        timeout-minutes: 10
+        run: |
+          ./build/hftbt run --config backtest/hft_strategy.ini --set market.ticks_per_session=4000 --json "$RUNNER_TEMP/run.json"
+          ./build/hftbt generate --config backtest/hft_strategy.ini --set market.ticks_per_session=2000 --out "$RUNNER_TEMP/market.lobt"
+          ./build/hftbt info "$RUNNER_TEMP/market.lobt"
+          ./build/hftbt run --config backtest/hft_strategy.ini --set market.ticks="$RUNNER_TEMP/market.lobt"
+          ./build/hftbt import-hft "$(ls "$RUNNER_TEMP"/hft-session-*.rec | head -1)" --out "$RUNNER_TEMP/hft.lobt"
+          ./build/hftbt info "$RUNNER_TEMP/hft.lobt"

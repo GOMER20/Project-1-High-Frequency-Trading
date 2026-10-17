@@ -22,6 +22,7 @@ endif()
 option(LOB_BUILD_TESTS        "Build the GoogleTest unit tests"            ON)
 option(LOB_BUILD_BENCHMARKS   "Build the Google Benchmark suite"           ON)
 option(LOB_BUILD_HFT          "Build HFT, the engine as a program"         ON)
+option(LOB_BUILD_BACKTEST     "Build hftbt, the HFT Strategy backtester"   ON)
 option(LOB_NATIVE_ARCH        "Tune for the host CPU (-march=native)"      ON)
 option(LOB_ENABLE_LTO         "Link-time optimisation in Release builds"   ON)
 option(LOB_ENABLE_SANITIZERS  "Build with ASan + UBSan (use with Debug)"   OFF)
@@ -103,6 +104,14 @@ if(LOB_BUILD_HFT)
   target_include_directories(hft PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
 
+# --- Backtester --------------------------------------------------------------
+# HFT Strategy on tick data through the order book: run, validate, and make or
+# import tick files. Its sources include each other as "backtest/...".
+if(LOB_BUILD_BACKTEST)
+  lob_add_executable(hftbt backtest/hftbt.cpp)
+  target_include_directories(hftbt PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+endif()
+
 # --- Tests -------------------------------------------------------------------
 if(LOB_BUILD_TESTS)
   find_package(GTest CONFIG QUIET)
@@ -141,9 +150,14 @@ if(LOB_BUILD_TESTS)
     tests/load_by_time_test.cpp
     tests/market_data_test.cpp
     tests/replay_test.cpp
-    tests/hft_test.cpp)
+    tests/hft_test.cpp
+    tests/backtest_market_test.cpp
+    tests/backtest_sim_test.cpp
+    tests/backtest_strategy_test.cpp)
   target_link_libraries(lob_tests PRIVATE GTest::gtest_main)
   target_include_directories(lob_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  # Tests that read data files find them from here.
+  target_compile_definitions(lob_tests PRIVATE LOB_SOURCE_DIR="${CMAKE_CURRENT_SOURCE_DIR}")
   # Listing the tests runs the binary at build time. The default limit of 5
   # seconds is too tight for a sanitizer build on a busy machine.
   # The per-test limit turns a hang into a failure instead of a stalled run.
@@ -158,6 +172,20 @@ if(LOB_BUILD_TESTS)
         COMMAND ${LOB_NODE} ${CMAKE_CURRENT_SOURCE_DIR}/hft/node/smoke.mjs $<TARGET_FILE:hft>)
       set_tests_properties(HftNode.DrivesTheProgramFromAnotherLanguage PROPERTIES TIMEOUT 120)
     endif()
+  endif()
+
+  # The backtester end to end: a short validation from the shipped settings
+  # file, which must run, write its report and reach a verdict.
+  if(LOB_BUILD_BACKTEST)
+    add_test(NAME Hftbt.ValidatesFromTheSettingsFile
+      COMMAND $<TARGET_FILE:hftbt> validate --config ${CMAKE_CURRENT_SOURCE_DIR}/backtest/hft_strategy.ini
+        --set market.ticks_per_session=600 --set "market.symbols=AAPL, NVDA, TSLA" --set validation.sessions=6
+        --set validation.train_sessions=2
+        --set validation.test_sessions=2 --set validation.holdout_sessions=2
+        --set "validation.grid=strategy.enter_score=0.3|0.8"
+        --out ${CMAKE_CURRENT_BINARY_DIR}/hftbt-check)
+    set_tests_properties(Hftbt.ValidatesFromTheSettingsFile PROPERTIES TIMEOUT 600
+      PASS_REGULAR_EXPRESSION "Verdict: ")
   endif()
 
   # This test replaces global operator new to count allocations. Sanitizer
