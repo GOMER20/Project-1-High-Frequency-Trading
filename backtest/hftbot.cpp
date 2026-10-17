@@ -74,6 +74,8 @@ std::string clock_text(int minutes) {
   return text;
 }
 
+std::string minutes_text(int minutes) { return std::to_string(minutes) + (minutes == 1 ? " minute" : " minutes"); }
+
 std::int64_t percentile(std::vector<std::int64_t> values, double share) {
   if (values.empty()) {
     return 0;
@@ -135,7 +137,7 @@ class Bot {
     }
     stop_us_ = options_.run_minutes > 0 ? started_us_ + static_cast<std::int64_t>(options_.run_minutes) * 60'000'000 : 0;
     std::fprintf(stderr, "hftbot: trading %zu symbols as %s; stopping %s. Status in %s\n", symbols_.size(), trader_.c_str(),
-                 options_.run_minutes > 0 ? ("in " + std::to_string(options_.run_minutes) + " minutes").c_str()
+                 options_.run_minutes > 0 ? ("in " + minutes_text(options_.run_minutes)).c_str()
                                           : ("at " + clock_text(options_.stop_minutes) + " New York time").c_str(),
                  (std::filesystem::path(options_.dir) / "status.json").c_str());
 
@@ -471,7 +473,7 @@ class Bot {
     }
     if (strategy_.stopped()) return "its own kill switch: the run's loss limit";
     if (stop_us_ > 0) {
-      if (now >= stop_us_) return "its time was up (" + std::to_string(options_.run_minutes) + " minutes)";
+      if (now >= stop_us_) return "its time was up (" + minutes_text(options_.run_minutes) + ")";
     } else if (bt::live::new_york(now).minutes >= options_.stop_minutes) {
       return "its stop time, " + clock_text(options_.stop_minutes) + " New York time";
     }
