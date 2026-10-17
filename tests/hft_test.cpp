@@ -569,6 +569,34 @@ TEST_F(Hft, AQuoteWithNewSizesTopsUpOrStartsThePriceAgain) {
   EXPECT_EQ(core.stats().resting_house_orders, 0u);
 }
 
+TEST_F(Hft, TheHouseKeepsItsPlaceInTheQueueWhenItWantsLess) {
+  hello();
+  quote(0, {{100, 500}}, {{102, 400}});
+  const std::uint64_t id = rest(1, 0, Side::Buy, 100, 100);  // a client joins behind the house
+  quote(0, {{100, 800}}, {{102, 400}});                      // more wanted: it joins behind the client
+
+  // Less wanted: the newest house order goes, and the 500 that was there
+  // before the client stays where it was, ahead of it.
+  const std::uint64_t commands = core.stats().engine_commands;
+  quote(0, {{100, 500}}, {{102, 400}});
+  EXPECT_EQ(core.stats().engine_commands - commands, 1u);  // one cancel, nothing added
+  EXPECT_EQ(depth(0).bids, (Side2{{100, 600}}));
+
+  // A seller of 500 trades with the house, and the client is not reached...
+  for (const Reply& reply : order(2, 0, Side::Sell, 100, 500)) {
+    if (reply.kind == Kind::Fill) {
+      EXPECT_NE(reply.as<hft::Fill>().tag, 1u);
+    }
+  }
+  // ...until the next.
+  bool reached = false;
+  for (const Reply& reply : order(3, 0, Side::Sell, 100, 100)) {
+    reached = reached || (reply.kind == Kind::Fill && reply.as<hft::Fill>().tag == 1u &&
+                          reply.as<hft::Fill>().order_id == id);
+  }
+  EXPECT_TRUE(reached);
+}
+
 TEST_F(Hft, IgnoresAQuoteThatMakesNoSense) {
   hello();
   quote(0, {{100, 500}}, {{102, 400}});

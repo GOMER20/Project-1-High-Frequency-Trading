@@ -196,6 +196,7 @@ class Core {
     std::uint64_t order_id;
     std::uint32_t remaining;
     lob::Side side;
+    std::uint64_t placed;  // the house's own count of orders placed: larger is newer
   };
 
   struct Symbol {
@@ -405,7 +406,7 @@ class Core {
               Resting{event.order_id, running_.tag, event.resting, running_.house};
           if (running_.house) {
             symbols_[event.symbol].house.push_back(
-                HouseOrder{event.price, event.order_id, event.resting, event.side});
+                HouseOrder{event.price, event.order_id, event.resting, event.side, ++house_placed_});
             ++stats_.resting_house_orders;
           } else {
             ++stats_.resting_client_orders;
@@ -641,22 +642,38 @@ class Core {
       }
     }
 
-    // What has to go: orders at prices that are not wanted, and every order at
-    // a price where the house has more than is wanted. (There is no making an
-    // order smaller, so too much at a price means starting that price again.)
+    // What has to go: orders at prices that are not wanted, and, where the
+    // house has more at a price than is wanted, its newest orders there until
+    // it no longer has. (There is no making an order smaller.) Taking the
+    // newest first keeps the house's older orders where they are in the
+    // queue, as a trader thinning out would: a client's order behind them
+    // never moves ahead of them because the house wants less.
     std::array<std::uint64_t, kMostHouseOrders> stale;
+    std::array<bool, kMostHouseOrders> going{};
     std::size_t stale_count = 0;
     for (std::size_t index = 0; index < orders; ++index) {
-      const std::size_t side = house[index].side == lob::Side::Buy ? 0 : 1;
-      const std::uint8_t level = level_of[index];
-      if (level == kNotWanted || have[side][level] > wanted[side][level].quantity) {
+      if (level_of[index] == kNotWanted) {
+        going[index] = true;
         stale[stale_count++] = house[index].order_id;
       }
     }
     for (std::size_t side = 0; side < 2; ++side) {
+      const lob::Side book_side = side == 0 ? lob::Side::Buy : lob::Side::Sell;
       for (std::size_t level = 0; level < counts[side]; ++level) {
-        if (have[side][level] > wanted[side][level].quantity) {
-          have[side][level] = 0;  // all of it is about to be cancelled
+        while (have[side][level] > wanted[side][level].quantity) {
+          std::size_t newest = orders;
+          for (std::size_t index = 0; index < orders; ++index) {
+            if (!going[index] && level_of[index] == level && house[index].side == book_side &&
+                (newest == orders || house[index].placed > house[newest].placed)) {
+              newest = index;
+            }
+          }
+          if (newest == orders) {
+            break;
+          }
+          going[newest] = true;
+          stale[stale_count++] = house[newest].order_id;
+          have[side][level] -= house[newest].remaining;
         }
       }
     }
@@ -730,6 +747,7 @@ class Core {
   std::unique_ptr<lob::MatchingEngine> engine_;
   lob::SessionDigest digest_{0};
   std::uint64_t digest_at_limit_ = 0;  // the fingerprint when the recording reached its limit
+  std::uint64_t house_placed_ = 0;     // house orders placed, ever: their order of arrival
   Stats stats_;
   Running running_;
   bool shutdown_requested_ = false;
