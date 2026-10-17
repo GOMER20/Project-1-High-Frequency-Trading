@@ -44,6 +44,8 @@ struct RunSetup {
     out = QueueModel::Back;
   } else if (text == "front") {
     out = QueueModel::Front;
+  } else if (text == "hft") {
+    out = QueueModel::Hft;
   } else {
     return false;
   }
@@ -58,6 +60,8 @@ struct RunSetup {
       return "back";
     case QueueModel::Front:
       return "front";
+    case QueueModel::Hft:
+      return "hft";
   }
   return "?";
 }
@@ -70,6 +74,9 @@ struct RunSetup {
   market.seed = static_cast<std::uint32_t>(settings.integer("market.seed", market.seed));
   market.sessions = static_cast<std::uint32_t>(settings.integer("market.sessions", market.sessions));
   market.symbols = settings.list("market.symbols", market.symbols);
+  if (market.symbols.size() == 1 && market.symbols[0] == "all") {
+    market.symbols.clear();  // every listing in the practice market
+  }
   market.impact = settings.flag("market.impact", market.impact);
   market.ticks_per_session =
       static_cast<std::uint32_t>(settings.integer("market.ticks_per_session", market.ticks_per_session));
@@ -82,7 +89,7 @@ struct RunSetup {
   exchange.commission_per_share = settings.number("exchange.commission_per_share", exchange.commission_per_share);
   const std::string queue = settings.text("exchange.queue", queue_name(exchange.queue));
   if (!parse_queue(queue, exchange.queue)) {
-    settings.complain("exchange.queue = " + queue + " is not prorata, back or front");
+    settings.complain("exchange.queue = " + queue + " is not prorata, back, front or hft");
   }
   exchange.print_fills = settings.flag("exchange.print_fills", exchange.print_fills);
   exchange.depth_levels = static_cast<std::size_t>(
@@ -119,6 +126,8 @@ struct RunSetup {
   require(strategy.flow_window >= 1, "strategy.flow_window must be at least 1");
   require(strategy.order_size >= 1, "strategy.order_size must be at least 1");
   require(strategy.target_ticks >= 1, "strategy.target_ticks must be at least 1");
+  require(strategy.breakeven_ticks >= 0 && strategy.stop_ticks >= 0, "strategy breakeven and stop ticks cannot be negative");
+  require(strategy.max_volatility >= 0 && strategy.vol_halflife_ms >= 0, "strategy volatility settings cannot be negative");
   require(strategy.time_stop_ms >= 1 && strategy.entry_timeout_ms >= 1, "strategy time limits must be at least 1 ms");
   require(strategy.min_spread_ticks >= 1 && strategy.max_spread_ticks >= strategy.min_spread_ticks,
           "strategy spread range must be 1 or more, low to high");

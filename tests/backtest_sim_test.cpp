@@ -159,14 +159,14 @@ TEST(Backtester, AnOrderWaitsBehindTheQueueAndFillsAsPrintsReachIt) {
 // The size at our price shrinks by 400 with 500 ahead of us and 300 behind;
 // a print of 300 then comes. How much of it reaches us depends on where the
 // 400 came from.
-std::uint32_t filled_after_shrink(bt::QueueModel queue) {
+std::uint32_t filled_after_shrink(bt::QueueModel queue, std::uint32_t shrink_to = 400) {
   auto source = source_of({
       open_at(0),
       quote_at(ms(100), 10'000, 10'002, 500, 500),
       // The size a quote shows is the market's own, without us in it: 300 more
       // joins, behind our 100.
       quote_at(ms(300), 10'000, 10'002, 800, 500),
-      quote_at(ms(400), 10'000, 10'002, 400, 500),  // 400 fewer: 800 down to 400
+      quote_at(ms(400), 10'000, 10'002, shrink_to, 500),  // 400 fewer: 800 down to 400
       print_at(ms(500), 10'000, 300, Side::Sell),
       close_at(ms(600)),
   });
@@ -185,6 +185,14 @@ TEST(Backtester, WhereAShrinkingQueueShrinksIsTheQueueModels) {
   EXPECT_EQ(filled_after_shrink(bt::QueueModel::Back), 0u);
   // Front: 400 from ahead, leaving 100: we are filled in full.
   EXPECT_EQ(filled_after_shrink(bt::QueueModel::Front), 100u);
+  // HFT's house: whole orders, newest first. The 300 behind go, which is not
+  // enough, so the 500 ahead goes too and 400 comes back behind us: we are
+  // first, and filled in full.
+  EXPECT_EQ(filled_after_shrink(bt::QueueModel::Hft), 100u);
+  // But down to 600 only, the 300 behind going is enough (100 comes back,
+  // behind): the 500 stays ahead, and the print does not reach us.
+  EXPECT_EQ(filled_after_shrink(bt::QueueModel::Hft, 600), 0u);
+  EXPECT_EQ(filled_after_shrink(bt::QueueModel::Back, 600), 0u);
 }
 
 TEST(Backtester, NewSizeAtAPriceJoinsBehindUs) {

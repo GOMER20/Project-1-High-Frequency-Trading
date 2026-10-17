@@ -379,6 +379,161 @@ TEST(HftStrategy, CommissionCountsTowardsTheKillSwitch) {
   EXPECT_EQ(outcome.counters.entries, 1u);
 }
 
+TEST(HftStrategy, VolatilityFilterKeepsItOutOfAFastMarket) {
+  bt::StrategyConfig config;
+  config.max_volatility = 0.5;  // ticks a second
+  // The mid moves a tick every half second: two ticks a second.
+  std::vector<Tick> fast{open_at(0)};
+  for (int step = 1; step <= 40; ++step) {
+    const std::int64_t bid = 9'999 + (step % 2);
+    fast.push_back(quote_at(ms(500 * step), bid, bid + 1, 900, 100));
+  }
+  fast.push_back(close_at(ms(500 * 41)));
+  const Outcome moving = run(fast, config);
+  EXPECT_EQ(moving.result.orders_sent, 0u);
+  EXPECT_GT(moving.counters.too_volatile, 0u);
+
+  // A still one: it waits for twenty quotes to know, then enters.
+  std::vector<Tick> still{open_at(0)};
+  for (int step = 1; step <= 40; ++step) {
+    still.push_back(leaning_up(ms(500 * step)));
+  }
+  still.push_back(close_at(ms(500 * 41)));
+  const Outcome quiet = run(still, config);
+  EXPECT_GE(quiet.counters.entries, 1u);
+  EXPECT_GT(quiet.counters.too_volatile, 0u);  // the first quotes, before it could tell
+}
+
+TEST(HftStrategy, QueueSideJoinsTheShorterQueue) {
+  bt::StrategyConfig config;
+  config.queue_side = true;
+  config.enter_score = 10;  // the score never vetoes
+  config.cancel_score = -10;
+  const Outcome bids = run({open_at(0), quote_at(ms(500), 9'999, 10'000, 200, 900), close_at(ms(1'000))}, config);
+  const Outcome asks = run({open_at(0), quote_at(ms(500), 9'999, 10'000, 900, 200), close_at(ms(1'000))}, config);
+  EXPECT_EQ(bids.counters.entries, 1u);
+  EXPECT_EQ(asks.counters.entries, 1u);
+  // The bid queue was the shorter in the first market, the offer's in the second: a buy then a sell.
+  const Outcome filled_buy = run(
+      {open_at(0), quote_at(ms(500), 9'999, 10'000, 200, 900), quote_at(ms(1'000), 9'998, 9'999, 500, 500), close_at(ms(1'500))}, config);
+  ASSERT_EQ(filled_buy.result.trips.size(), 1u);
+  EXPECT_EQ(filled_buy.result.trips[0].side, Side::Buy);
+  const Outcome filled_sell = run(
+      {open_at(0), quote_at(ms(500), 9'999, 10'000, 900, 200), quote_at(ms(1'000), 10'000, 10'001, 500, 500), close_at(ms(1'500))}, config);
+  ASSERT_EQ(filled_sell.result.trips.size(), 1u);
+  EXPECT_EQ(filled_sell.result.trips[0].side, Side::Sell);
+}
+
+TEST(HftStrategy, BreakevenOffersThePositionOutAtItsEntryPrice) {
+  bt::StrategyConfig config;
+  config.breakeven_ticks = 1;
+  config.scratch_score = 0;
+  const Outcome outcome = run(
+      {
+          open_at(0),
+          leaning_up(ms(500)),
+          quote_at(ms(1'000), 9'998, 9'999, 500, 500),   // filled at 99.99; the bid is now a tick below
+          quote_at(ms(1'500), 9'998, 9'999, 500, 500),   // the exit comes back to 99.99
+          quote_at(ms(2'000), 9'999, 10'000, 500, 500),  // and the bid comes up to it
+          close_at(ms(2'500)),
+      },
+      config);
+  ASSERT_EQ(outcome.result.trips.size(), 1u);
+  EXPECT_EQ(outcome.counters.breakevens, 1u);
+  EXPECT_NEAR(outcome.result.trips[0].pnl, 0.0, 1e-9);  // scratched: no loss
+  EXPECT_FALSE(outcome.result.trips[0].forced);
+}
+
+TEST(HftStrategy, PriceStopGetsOutWhenTheMarketRunsAgainstIt) {
+  bt::StrategyConfig config;
+  config.stop_ticks = 2;
+  config.scratch_score = 0;
+  const Outcome outcome = run(
+      {
+          open_at(0),
+          leaning_up(ms(500)),
+          quote_at(ms(1'000), 9'998, 9'999, 500, 500),  // filled at 99.99
+          quote_at(ms(1'500), 9'997, 9'998, 500, 500),  // two ticks against: out
+          quote_at(ms(2'000), 9'997, 9'998, 500, 500),
+          close_at(ms(2'500)),
+      },
+      config);
+  ASSERT_EQ(outcome.result.trips.size(), 1u);
+  EXPECT_EQ(outcome.counters.price_stops, 1u);
+  EXPECT_NEAR(outcome.result.trips[0].pnl, -2.00, 1e-9);  // sold at the bid, 99.97
+  EXPECT_LT(outcome.result.trips[0].closed_us, ms(1'600));
+}
+
+TEST(HftStrategy, CoinTossBaselineIgnoresTheFiltersUnlessAsked) {
+  std::vector<Tick> toxic{open_at(0)};
+  for (int index = 0; index < 10; ++index) {
+    toxic.push_back(print_at(ms(100 + index), 9'999, 100, Side::Sell));
+  }
+  toxic.push_back(quote_at(ms(500), 9'999, 10'000, 500, 500));
+  toxic.push_back(close_at(ms(1'000)));
+  bt::StrategyConfig config;
+  config.random_entries = true;
+  EXPECT_EQ(run(toxic, config).counters.entries, 1u);  // nothing read from the market
+  config.random_filters = true;
+  const Outcome filtered = run(toxic, config);
+  EXPECT_EQ(filtered.counters.entries, 0u);
+  EXPECT_EQ(filtered.counters.too_toxic, 1u);
+}
+
+TEST(HftStrategy, AFeedWithoutItsOwnOrdersIsReadAsItIs) {
+  // In the backtester the book shows the strategy's own orders, and it takes
+  // them out. Gomer Trading's feed does not show them; with the flag off it
+  // takes nothing out. Here the house leaves 99.99 and only our order is
+  // there: the backtester's book still shows 100 at 99.99, so with the flag
+  // off the strategy believes someone is still bidding there, and stays.
+  bt::StrategyConfig config;
+  config.cancel_score = -10;
+  config.feed_shows_own_orders = false;
+  const Outcome outcome = run({open_at(0), leaning_up(ms(500)), quote_at(ms(1'000), 9'998, 10'000, 900, 100), close_at(ms(1'500))}, config);
+  EXPECT_EQ(outcome.counters.entries_withdrawn, 0u);
+}
+
+TEST(HftStrategy, HaltGetsOutOfEverythingAndStopsEntering) {
+  // A strategy that halts itself a moment after it has bought.
+  class Halting final : public bt::Strategy {
+   public:
+    explicit Halting(bt::StrategyConfig config) : inner(config) {}
+    void on_start(bt::Context& context) override { inner.on_start(context); }
+    void on_market(bt::Context& context, const bt::MarketUpdate& update) override { inner.on_market(context, update); }
+    void on_fill(bt::Context& context, const bt::FillReport& fill) override {
+      inner.on_fill(context, fill);
+      if (!inner.stopped() && fill.order_id != 0) {
+        inner.halt(context);
+      }
+    }
+    void on_order(bt::Context& context, const bt::OrderReport& report) override { inner.on_order(context, report); }
+    void on_timer(bt::Context& context, std::uint64_t token) override { inner.on_timer(context, token); }
+    void on_session(bt::Context& context, std::uint16_t symbol, bool open) override { inner.on_session(context, symbol, open); }
+    bt::HftStrategy inner;
+  };
+  bt::TickVectorSource source({{"TEST", 10'000}}, {open_at(0), leaning_up(ms(500)), quote_at(ms(1'000), 9'998, 9'999, 500, 500),
+                                                   leaning_up(ms(1'500)), leaning_up(ms(2'000)), close_at(ms(2'500))});
+  Halting strategy{bt::StrategyConfig{}};
+  bt::Simulator simulator(source, strategy, touch_only());
+  const bt::RunResult result = simulator.run();
+  ASSERT_EQ(result.trips.size(), 1u);
+  EXPECT_FALSE(result.trips[0].forced);  // closed by the halt, not the session's end
+  EXPECT_TRUE(strategy.inner.stopped());
+  EXPECT_TRUE(strategy.inner.idle());
+  EXPECT_EQ(strategy.inner.counters().entries, 1u);  // nothing new after the halt
+  EXPECT_TRUE(strategy.inner.holdings().empty());
+}
+
+TEST(Settings, AllMeansEveryListingAndEntrySideMustBeKnown) {
+  std::string error;
+  std::optional<bt::Settings> settings = bt::Settings::parse("[market]\nsymbols = all\n[strategy]\nentry_side = sideways\n", error);
+  ASSERT_TRUE(settings);
+  const bt::RunSetup setup = bt::read_setup(*settings);
+  EXPECT_TRUE(setup.market.symbols.empty());
+  ASSERT_EQ(settings->problems().size(), 1u);
+  EXPECT_NE(settings->problems()[0].find("entry_side"), std::string::npos);
+}
+
 TEST(HftStrategy, PracticeMarketRunRespectsItsLimits) {
   bt::PracticeMarketOptions options;
   options.ticks_per_session = 2'000;
@@ -468,11 +623,13 @@ TEST(Settings, TheShippedFileReadsCleanly) {
   ASSERT_TRUE(settings) << error;
   const bt::RunSetup setup = bt::read_setup(*settings);
   EXPECT_TRUE(settings->problems().empty()) << settings->problems().front();
-  EXPECT_EQ(setup.market.symbols.size(), 10u);
-  EXPECT_FALSE(setup.exchange.print_fills);
-  EXPECT_EQ(setup.exchange.queue, bt::QueueModel::ProRata);
-  EXPECT_DOUBLE_EQ(setup.strategy.enter_score, 0.5);
+  EXPECT_TRUE(setup.market.symbols.empty());  // "all": every listing
+  EXPECT_TRUE(setup.exchange.print_fills);    // the realistic sandbox
+  EXPECT_EQ(setup.exchange.queue, bt::QueueModel::Hft);
+  EXPECT_TRUE(setup.strategy.queue_side);
+  EXPECT_DOUBLE_EQ(setup.strategy.max_volatility, 0.5);
   EXPECT_EQ(setup.strategy.target_ticks, 1);
+  EXPECT_EQ(setup.strategy.breakeven_ticks, 2);
   EXPECT_EQ(setup.validation.grid.size(), 3u);
 }
 

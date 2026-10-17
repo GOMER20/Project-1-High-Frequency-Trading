@@ -41,7 +41,10 @@
 //             if the market's touch moves off its price ("the queue turns
 //             against it"), or if it has waited `entry_timeout_ms`.
 //   holding   Once filled it offers the position out `target_ticks` away. If
-//             that has not happened within `time_stop_ms`, or the score turns
+//             the market moves `breakeven_ticks` against it, the offer comes
+//             back to the entry price, to scratch the trade without a loss; at
+//             `stop_ticks` against it, it gets out at once. If none of that has
+//             happened within `time_stop_ms`, or the score turns
 //             `scratch_score` against the position, it gets out at once at the
 //             market.
 //
@@ -49,8 +52,11 @@
 // that stops the session (and, past a larger loss, the whole run) and gets
 // out of everything.
 //
-// With `random_entries` it enters on a coin toss instead of the score, with
-// every other rule the same: the baseline a real edge has to beat.
+// With `random_entries` it enters on a coin toss, using none of what it reads
+// from the market (neither the score nor the toxicity and volatility filters),
+// with every other rule the same: the baseline a real edge has to beat. With
+// `random_filters` as well, the filters stay and only the side is a coin toss,
+// which shows how much of an edge comes from the filters alone.
 
 namespace bt {
 
@@ -63,10 +69,20 @@ struct StrategyConfig {
   double w_micro = 1.0;
   double w_flow = 0.5;
   double w_trend = 0.0;
+  double vol_halflife_ms = 60'000;     // how fast the volatility measure forgets
   // --- Entry ---
   double enter_score = 0.4;
   double cancel_score = 0.1;           // a working entry is withdrawn once the score is below this
   double max_toxicity = 0.6;
+  // Only enter when the mid has been moving at most this many ticks a second
+  // (0: any). With a one-tick spread, a market maker earns the spread only if
+  // the price moves slowly compared with how fast the queue fills.
+  double max_volatility = 0;
+  // Which side to join: "score" (the side the score points to, when it is
+  // past enter_score) or "queue" (the side with less ahead in the queue, so
+  // the quicker to fill; the score still has to clear enter_score on neither
+  // side against it).
+  bool queue_side = false;
   std::int64_t min_spread_ticks = 1;
   std::int64_t max_spread_ticks = 3;
   std::uint32_t order_size = 100;
@@ -74,7 +90,9 @@ struct StrategyConfig {
   // --- Exit ---
   std::int64_t target_ticks = 1;
   std::int64_t time_stop_ms = 3'000;
-  double scratch_score = 0.4;          // out at once if the score is this far against the position
+  double scratch_score = 0.4;          // out at once if the score is this far against the position (0: never)
+  std::int64_t breakeven_ticks = 0;    // market this many ticks against: offer out at the entry price instead (0: never)
+  std::int64_t stop_ticks = 0;         // market this many ticks against: out at once (0: never)
   // --- Risk ---
   std::int64_t max_position = 200;     // shares, per symbol
   std::int64_t max_total_position = 1'000;
@@ -83,10 +101,16 @@ struct StrategyConfig {
   std::int64_t max_orders_per_second = 20;
   // --- Baseline ---
   bool random_entries = false;
+  bool random_filters = false;
   std::uint32_t random_seed = 1;
   // Not read from [strategy]: the exchange's commission, so that the kill
   // switch counts what trading costs.
   double commission_per_share = 0;
+  // Not read from [strategy]: whether the market data shows the strategy's
+  // own orders in the book. The backtester's does, and they are taken out of
+  // the signals; Gomer Trading's feed does not, so live there is nothing to
+  // take out.
+  bool feed_shows_own_orders = true;
 
   // Reads the [strategy] section.
   void read(Settings& settings) {
@@ -97,9 +121,17 @@ struct StrategyConfig {
     w_micro = settings.number("strategy.w_micro", w_micro);
     w_flow = settings.number("strategy.w_flow", w_flow);
     w_trend = settings.number("strategy.w_trend", w_trend);
+    vol_halflife_ms = settings.number("strategy.vol_halflife_ms", vol_halflife_ms);
     enter_score = settings.number("strategy.enter_score", enter_score);
     cancel_score = settings.number("strategy.cancel_score", cancel_score);
     max_toxicity = settings.number("strategy.max_toxicity", max_toxicity);
+    max_volatility = settings.number("strategy.max_volatility", max_volatility);
+    const std::string side = settings.text("strategy.entry_side", queue_side ? "queue" : "score");
+    if (side == "queue" || side == "score") {
+      queue_side = side == "queue";
+    } else {
+      settings.complain("strategy.entry_side = " + side + " is not score or queue");
+    }
     min_spread_ticks = settings.integer("strategy.min_spread_ticks", min_spread_ticks);
     max_spread_ticks = settings.integer("strategy.max_spread_ticks", max_spread_ticks);
     order_size = static_cast<std::uint32_t>(settings.integer("strategy.order_size", order_size));
@@ -107,12 +139,15 @@ struct StrategyConfig {
     target_ticks = settings.integer("strategy.target_ticks", target_ticks);
     time_stop_ms = settings.integer("strategy.time_stop_ms", time_stop_ms);
     scratch_score = settings.number("strategy.scratch_score", scratch_score);
+    breakeven_ticks = settings.integer("strategy.breakeven_ticks", breakeven_ticks);
+    stop_ticks = settings.integer("strategy.stop_ticks", stop_ticks);
     max_position = settings.integer("strategy.max_position", max_position);
     max_total_position = settings.integer("strategy.max_total_position", max_total_position);
     max_session_loss = settings.number("strategy.max_session_loss", max_session_loss);
     max_run_loss = settings.number("strategy.max_run_loss", max_run_loss);
     max_orders_per_second = settings.integer("strategy.max_orders_per_second", max_orders_per_second);
     random_entries = settings.flag("strategy.random_entries", random_entries);
+    random_filters = settings.flag("strategy.random_filters", random_filters);
     random_seed = static_cast<std::uint32_t>(settings.integer("strategy.random_seed", random_seed));
   }
 };
@@ -125,9 +160,12 @@ struct StrategyCounters {
   std::uint64_t target_exits = 0;     // positions closed at the target
   std::uint64_t time_stops = 0;
   std::uint64_t scratches = 0;        // closed early because the signal turned
+  std::uint64_t breakevens = 0;       // exits brought back to the entry price
+  std::uint64_t price_stops = 0;      // closed early because the price moved against it
   std::uint64_t kill_switches = 0;
   std::uint64_t refused_by_limits = 0;  // entries a risk limit stopped
   std::uint64_t too_toxic = 0;        // entries the toxicity filter stopped
+  std::uint64_t too_volatile = 0;     // entries the volatility filter stopped
 };
 
 // Does the book say anything about where the price goes next? For every
@@ -210,6 +248,50 @@ class HftStrategy final : public Strategy {
 
   // Measures how well the signals predict the price, as the run goes.
   void check_signals(SignalCheck* check) noexcept { check_ = check; }
+
+  // Stops trading for good: no new entries, every entry withdrawn, every
+  // position closed at the market. For the end of a live session, a kill
+  // switch from outside, or the program being asked to stop.
+  void halt(Context& context) {
+    run_killed_ = true;
+    everything_out(context);
+  }
+
+  // Whether it has stopped trading: halted, or a kill switch tripped.
+  [[nodiscard]] bool stopped() const noexcept { return run_killed_; }
+  [[nodiscard]] bool session_stopped() const noexcept { return session_killed_; }
+
+  // Nothing held and nothing working, in any symbol.
+  [[nodiscard]] bool idle() const noexcept {
+    return std::all_of(symbols_.begin(), symbols_.end(), [](const SymbolState& state) {
+      return state.position == 0 && state.entry_id == 0 && state.exit_id == 0 && state.flatten_id == 0;
+    });
+  }
+
+  struct Holding {
+    std::uint16_t symbol;
+    std::int64_t shares;       // + long, - short
+    std::int64_t entry_price;  // cents
+    std::int64_t mid2;         // twice the mid it is marked at, in cents
+  };
+
+  // What it holds now, as it sees it.
+  [[nodiscard]] std::vector<Holding> holdings() const {
+    std::vector<Holding> held;
+    for (std::size_t symbol = 0; symbol < symbols_.size(); ++symbol) {
+      const SymbolState& state = symbols_[symbol];
+      if (state.position != 0) {
+        held.push_back(Holding{static_cast<std::uint16_t>(symbol), state.position, state.entry_price,
+                               state.market_bid + state.market_ask});
+      }
+    }
+    return held;
+  }
+
+  // Profit or loss as the strategy counts it (for its kill switches), what is
+  // held marked at the mid: this session, and the whole run.
+  [[nodiscard]] double session_pnl() const { return marked(session_cash_); }
+  [[nodiscard]] double run_pnl() const { return marked(run_cash_); }
 
   void on_start(Context& context) override {
     symbols_.assign(context.symbols().size(), SymbolState{});
@@ -392,6 +474,13 @@ class HftStrategy final : public Strategy {
     double flow = 0;
     double toxicity = 0;
     double trend = 0;
+    // Ticks a second the mid has been moving: an average that forgets, and how
+    // much of its weight it has gathered so far. It starts from nothing, so
+    // until it has gathered all of it, the average alone reads too low; it is
+    // divided by its weight to be fair from the first quote.
+    double volatility = 0;
+    double volatility_weight = 0;
+    std::uint32_t volatility_samples = 0;
     double score = 0;
     std::int64_t last_mid2 = 0;
     std::int64_t last_quote_us = 0;
@@ -412,6 +501,7 @@ class HftStrategy final : public Strategy {
     std::uint32_t exit_resting = 0;     // in the book, as far as we know
     std::uint64_t flatten_id = 0;
     bool flatten_wanted = false;
+    bool at_breakeven = false;          // the exit is, or is to be, at the entry price
     std::int64_t position = 0;
     std::int64_t entry_price = 0;
     std::int64_t opened_us = 0;
@@ -438,6 +528,9 @@ class HftStrategy final : public Strategy {
   // The signals from a fresh look at the book, with our own orders taken out.
   void read_book(SymbolState& state, const MarketUpdate& update) {
     const auto ours_at = [&](lob::Side side, std::int64_t price) -> std::uint64_t {
+      if (!config_.feed_shows_own_orders) {
+        return 0;
+      }
       std::uint64_t ours = 0;
       if (state.entry_id != 0 && state.entry_side == side && state.entry_order_price == price) {
         ours += state.entry_resting;
@@ -484,6 +577,11 @@ class HftStrategy final : public Strategy {
         const double elapsed_ms = static_cast<double>(update.time_us - state.last_quote_us) / 1'000.0;
         const double keep = config_.trend_halflife_ms > 0 ? std::exp2(-elapsed_ms / config_.trend_halflife_ms) : 0;
         state.trend = keep * state.trend + (1 - keep) * static_cast<double>(mid2 - state.last_mid2) / 2.0;
+        const double forget = config_.vol_halflife_ms > 0 ? std::exp2(-elapsed_ms / config_.vol_halflife_ms) : 0;
+        const double rate = static_cast<double>(std::abs(mid2 - state.last_mid2)) / 2.0 / std::max(elapsed_ms / 1'000.0, 1e-3);
+        state.volatility = forget * state.volatility + (1 - forget) * rate;
+        state.volatility_weight = forget * state.volatility_weight + (1 - forget);
+        ++state.volatility_samples;
       }
       state.last_mid2 = mid2;
       state.last_quote_us = update.time_us;
@@ -498,9 +596,31 @@ class HftStrategy final : public Strategy {
       return;
     }
     if (state.position != 0) {
-      // Holding: out at once if the signal has turned against us.
-      const double against = state.position > 0 ? -state.score : state.score;
-      if (!state.flatten_wanted && against >= config_.scratch_score) {
+      if (state.flatten_wanted) {
+        return;
+      }
+      // Holding. How far the market has gone against the position, in ticks:
+      // for a long, how far the bid is below where it was bought.
+      const bool long_position = state.position > 0;
+      const std::int64_t adverse =
+          long_position ? state.entry_price - state.market_bid : state.market_ask - state.entry_price;
+      if (config_.stop_ticks > 0 && adverse >= config_.stop_ticks) {
+        ++counters_.price_stops;
+        get_out(context, symbol);
+        return;
+      }
+      if (config_.breakeven_ticks > 0 && adverse >= config_.breakeven_ticks && !state.at_breakeven) {
+        // Offer it out where it was bought instead: the exit is cancelled and
+        // comes back at the entry price when the cancel is confirmed.
+        state.at_breakeven = true;
+        ++counters_.breakevens;
+        if (state.exit_id != 0) {
+          context.cancel(state.exit_id);
+        }
+      }
+      // Out at once if the signal has turned against us.
+      const double against = long_position ? -state.score : state.score;
+      if (config_.scratch_score > 0 && against >= config_.scratch_score) {
         ++counters_.scratches;
         get_out(context, symbol);
       }
@@ -532,6 +652,12 @@ class HftStrategy final : public Strategy {
     int side = 0;  // +1 buy, -1 sell
     if (config_.random_entries) {
       side = random_() < 0.5 ? 1 : -1;
+    } else if (config_.queue_side) {
+      // The shorter queue, unless the score is clearly against that side.
+      side = state.market_bid_size <= state.market_ask_size ? 1 : -1;
+      if ((side > 0 ? -state.score : state.score) >= config_.enter_score) {
+        side = 0;
+      }
     } else if (state.score >= config_.enter_score) {
       side = 1;
     } else if (state.score <= -config_.enter_score) {
@@ -540,7 +666,14 @@ class HftStrategy final : public Strategy {
     if (side == 0) {
       return;
     }
-    if (state.toxicity > config_.max_toxicity) {
+    const bool filtered = !config_.random_entries || config_.random_filters;
+    if (filtered && config_.max_volatility > 0 &&
+        (state.volatility_samples < 20 || state.volatility_weight <= 0 ||
+         state.volatility / state.volatility_weight > config_.max_volatility)) {
+      ++counters_.too_volatile;
+      return;
+    }
+    if (filtered && state.toxicity > config_.max_toxicity) {
       ++counters_.too_toxic;
       return;
     }
@@ -579,7 +712,8 @@ class HftStrategy final : public Strategy {
     }
     const bool long_position = state.position > 0;
     state.exit_side = long_position ? lob::Side::Sell : lob::Side::Buy;
-    state.exit_price = state.entry_price + (long_position ? config_.target_ticks : -config_.target_ticks);
+    state.exit_price = state.at_breakeven ? state.entry_price
+                                          : state.entry_price + (long_position ? config_.target_ticks : -config_.target_ticks);
     state.exit_resting = 0;
     state.exit_id = send(context, symbol, state.exit_side, state.exit_price,
                          static_cast<std::uint32_t>(std::abs(state.position)), OrderKind::Limit);
@@ -613,6 +747,7 @@ class HftStrategy final : public Strategy {
 
   void flat(SymbolState& state) {
     state.flatten_wanted = false;
+    state.at_breakeven = false;
     state.entry_filled = false;
     state.entry_cancel_sent = false;
     ++state.generation;  // any timer still set for the old position is stale now

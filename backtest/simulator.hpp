@@ -54,6 +54,12 @@ enum class QueueModel : std::uint8_t {
   ProRata,  // shrinking comes from ahead and behind in proportion to how much is in each
   Back,     // shrinking comes from behind first: cancellations never move us up (pessimistic)
   Front,    // shrinking comes from ahead first (optimistic)
+  // As HFT's house does it (hft/core.hpp), and so as Gomer Trading's
+  // realistic sandbox does: whole orders go, newest first, until there is no
+  // more than is wanted, and what is then short is added at the back. When
+  // the cut is more than is behind us, an order ahead of us goes whole and
+  // comes back behind: we move up.
+  Hft,
 };
 
 struct SimConfig {
@@ -192,21 +198,35 @@ struct RunResult {
 
 class Simulator;
 
-// The strategy's handle on the exchange. Everything it does takes effect
-// after the configured delays.
+// The strategy's handle on the exchange: the backtester's, or a live
+// gateway's (live.hpp). The same strategy runs on either.
 class Context {
  public:
-  explicit Context(Simulator& sim) : sim_(sim) {}
+  virtual ~Context() = default;
 
-  [[nodiscard]] std::int64_t now() const noexcept;
-  [[nodiscard]] std::span<const SymbolInfo> symbols() const noexcept;
+  [[nodiscard]] virtual std::int64_t now() const noexcept = 0;
+  [[nodiscard]] virtual std::span<const SymbolInfo> symbols() const noexcept = 0;
 
   // Returns the order's ID, which every report about it carries.
-  std::uint64_t submit(std::uint16_t symbol, lob::Side side, std::int64_t price, std::uint32_t quantity,
-                       OrderKind kind = OrderKind::Limit);
-  void cancel(std::uint64_t order_id);
+  virtual std::uint64_t submit(std::uint16_t symbol, lob::Side side, std::int64_t price, std::uint32_t quantity,
+                               OrderKind kind = OrderKind::Limit) = 0;
+  virtual void cancel(std::uint64_t order_id) = 0;
   // Calls on_timer(token) at `time_us`.
-  void wake_at(std::int64_t time_us, std::uint64_t token);
+  virtual void wake_at(std::int64_t time_us, std::uint64_t token) = 0;
+};
+
+// The backtester's: everything the strategy does takes effect after the
+// configured delays.
+class SimContext final : public Context {
+ public:
+  explicit SimContext(Simulator& sim) : sim_(sim) {}
+
+  [[nodiscard]] std::int64_t now() const noexcept override;
+  [[nodiscard]] std::span<const SymbolInfo> symbols() const noexcept override;
+  std::uint64_t submit(std::uint16_t symbol, lob::Side side, std::int64_t price, std::uint32_t quantity,
+                       OrderKind kind = OrderKind::Limit) override;
+  void cancel(std::uint64_t order_id) override;
+  void wake_at(std::int64_t time_us, std::uint64_t token) override;
 
  private:
   Simulator& sim_;
@@ -477,6 +497,16 @@ class Simulator {
     }
     if (house <= wanted) {
       return;
+    }
+    if (config_.queue == QueueModel::Hft) {
+      // Newest first is back of the queue first: the queue is in time order.
+      for (std::size_t index = queue_.size(); index-- > 0 && house > wanted;) {
+        if (!queue_[index].ours) {
+          book.book->cancel(queue_[index].id);
+          house -= queue_[index].quantity;
+        }
+      }
+      return;  // grow() adds whatever is now short, at the back
     }
     const std::uint64_t cut = house - wanted;
     const std::uint64_t behind = house - ahead;
@@ -877,7 +907,7 @@ class Simulator {
   TickSource& source_;
   Strategy& strategy_;
   SimConfig config_;
-  Context context_;
+  SimContext context_;
   std::vector<Book> books_;
   std::vector<Position> positions_;
   std::priority_queue<Event, std::vector<Event>, Later> events_;
@@ -901,13 +931,13 @@ class Simulator {
   RunResult result_;
 };
 
-inline std::int64_t Context::now() const noexcept { return sim_.now(); }
-inline std::span<const SymbolInfo> Context::symbols() const noexcept { return sim_.symbols(); }
-inline std::uint64_t Context::submit(std::uint16_t symbol, lob::Side side, std::int64_t price, std::uint32_t quantity,
-                                     OrderKind kind) {
+inline std::int64_t SimContext::now() const noexcept { return sim_.now(); }
+inline std::span<const SymbolInfo> SimContext::symbols() const noexcept { return sim_.symbols(); }
+inline std::uint64_t SimContext::submit(std::uint16_t symbol, lob::Side side, std::int64_t price, std::uint32_t quantity,
+                                        OrderKind kind) {
   return sim_.submit(symbol, side, price, quantity, kind);
 }
-inline void Context::cancel(std::uint64_t order_id) { sim_.cancel(order_id); }
-inline void Context::wake_at(std::int64_t time_us, std::uint64_t token) { sim_.wake_at(time_us, token); }
+inline void SimContext::cancel(std::uint64_t order_id) { sim_.cancel(order_id); }
+inline void SimContext::wake_at(std::int64_t time_us, std::uint64_t token) { sim_.wake_at(time_us, token); }
 
 }  // namespace bt

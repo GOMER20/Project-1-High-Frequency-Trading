@@ -288,6 +288,10 @@ struct Validation {
   Summary final_in_sample;
   Summary holdout;
   Summary baseline_holdout;
+  // The coin toss for the side only, with the strategy's filters kept: where
+  // the edge comes from.
+  Summary filtered_baseline_out_of_sample;
+  Summary filtered_baseline_holdout;
   double baseline_gap_t = 0;    // out of sample: how far the strategy's profit per trade is above the baseline's
 
   Summary reference;            // the final settings over every session: what the rows below are compared with
@@ -300,6 +304,7 @@ struct Validation {
   bool edge = false;
   std::string verdict;          // one line
   std::vector<std::string> reasons;
+  std::vector<std::string> caveats;  // stress tests under which it loses money
 };
 
 // Runs all of it. `base` is the settings file, not yet read.
@@ -433,6 +438,7 @@ struct Validation {
     }
   };
   add("baseline", {{"strategy.random_entries", "true"}}, false);
+  add("filtered baseline", {{"strategy.random_entries", "true"}, {"strategy.random_filters", "true"}}, false);
 
   struct Knob {
     const char* key;
@@ -451,6 +457,8 @@ struct Validation {
       {"strategy.target_ticks", static_cast<double>(s.target_ticks), true},
       {"strategy.time_stop_ms", static_cast<double>(s.time_stop_ms), true},
       {"strategy.entry_timeout_ms", static_cast<double>(s.entry_timeout_ms), true},
+      {"strategy.max_volatility", s.max_volatility, false},
+      {"strategy.vol_halflife_ms", s.vol_halflife_ms, true},
   };
   for (const Knob& knob : knobs) {
     std::vector<double> values;
@@ -485,11 +493,22 @@ struct Validation {
     add("Commission $" + number_text(commission) + " a share", {{"exchange.commission_per_share", number_text(commission)}},
         true);
   }
-  add("Back of the queue (cancels never move it up)", {{"exchange.queue", "back"}}, true);
+  if (exchange.queue != QueueModel::Back) {
+    add("Back of the queue (cancels never move it up)", {{"exchange.queue", "back"}}, true);
+  }
+  if (exchange.queue != QueueModel::ProRata) {
+    add("Pro-rata queue (some cancels are ahead of it)", {{"exchange.queue", "prorata"}}, true);
+  }
+  if (exchange.queue != QueueModel::Front) {
+    add("Front of the queue (every cancel is ahead of it: optimistic)", {{"exchange.queue", "front"}}, true);
+  }
+  if (exchange.queue != QueueModel::Hft) {
+    add("HFT's queue (whole house orders cancelled, newest first)", {{"exchange.queue", "hft"}}, true);
+  }
   if (!exchange.print_fills) {
-    add("Trade prints fill resting orders (not how Gomer Trading works)", {{"exchange.print_fills", "true"}}, true);
+    add("Trade prints fill resting orders (as in the realistic sandbox)", {{"exchange.print_fills", "true"}}, true);
   } else {
-    add("Trade prints do not fill resting orders (how Gomer Trading works)", {{"exchange.print_fills", "false"}}, true);
+    add("Trade prints do not fill resting orders (as in standard competitions)", {{"exchange.print_fills", "false"}}, true);
   }
   if (chosen.market.impact && chosen.ticks_file.empty()) {
     add("Its own trades do not move prices", {{"market.impact", "false"}}, true);
@@ -506,13 +525,14 @@ struct Validation {
       return out;
     }
     const Summary summary = summarize(extra[index].result, 0, total);
-    if (labels[index] == "baseline") {
+    if (labels[index] == "baseline" || labels[index] == "filtered baseline") {
       std::vector<std::pair<const RunResult*, std::pair<std::uint32_t, std::uint32_t>>> parts;
       for (const WalkStep& step : out.steps) {
         parts.push_back({&extra[index].result, {step.test_first, step.test_end}});
       }
-      out.baseline_out_of_sample = combine(parts);
-      out.baseline_holdout = summarize(extra[index].result, walk, total);
+      const bool unfiltered = labels[index] == "baseline";
+      (unfiltered ? out.baseline_out_of_sample : out.filtered_baseline_out_of_sample) = combine(parts);
+      (unfiltered ? out.baseline_holdout : out.filtered_baseline_holdout) = summarize(extra[index].result, walk, total);
     } else {
       (is_stress[index] ? out.stress : out.sensitivity).push_back(Variation{labels[index], summary});
     }
@@ -580,6 +600,17 @@ struct Validation {
     if (summary_json(variation.summary) == summary_json(out.reference)) {
       out.unchanged.push_back(variation.label);
     }
+    if (out.reference.net > 0 && variation.summary.net <= 0) {
+      out.caveats.push_back("It loses money with this change: " + variation.label + " (" + money(variation.summary.per_trade) +
+                            " a trade).");
+    }
+  }
+  if (profitable && out.filtered_baseline_out_of_sample.per_trade > 0 &&
+      out.filtered_baseline_out_of_sample.per_trade >= 0.8 * oos.per_trade) {
+    out.reasons.push_back("Where the edge comes from: choosing where and when to quote, not which side. With the same filters "
+                          "and a coin toss for the side it makes " +
+                          money(out.filtered_baseline_out_of_sample.per_trade) + " a trade out of sample, against the strategy's " +
+                          money(oos.per_trade) + "; with no filters at all, " + money(out.baseline_out_of_sample.per_trade) + ".");
   }
   if (out.edge) {
     out.verdict = "An edge, on this data. It made money out of sample and in the holdout, beat the coin-toss baseline "
@@ -604,14 +635,19 @@ struct Validation {
     return md + "Validation could not run: " + v.error + "\n";
   }
   md += "**Success rate out of sample: " + success_text(v.out_of_sample) + "**";
-  const auto [low, high] = v.out_of_sample.success_range();
   if (v.out_of_sample.trades > 0) {
-    md += format(" (the true rate is likely %.0f", low * 100) + format("-%.0f%%)", high * 100);
+    md += " (the true rate is likely " + success_range_text(v.out_of_sample) + ")";
   }
   md += "  \n**Holdout: " + success_text(v.holdout) + "**\n\n";
   md += "**Verdict: " + v.verdict + "**\n\n";
   for (const std::string& reason : v.reasons) {
     md += "- " + reason + "\n";
+  }
+  if (!v.caveats.empty()) {
+    md += "\n**Where it stops working:**\n\n";
+    for (const std::string& caveat : v.caveats) {
+      md += "- " + caveat + "\n";
+    }
   }
   md += "\nA success rate alone says little: a strategy can win most trades and still lose money if the losers are "
         "bigger. Read it with profit per trade and its t (about 2 or more before it means anything).\n\n";
@@ -622,7 +658,12 @@ struct Validation {
   md += summary_row("Holdout (" + std::to_string(v.holdout.sessions) + ")", v.holdout);
   md += summary_row("Coin-toss baseline, walk-forward tests", v.baseline_out_of_sample);
   md += summary_row("Coin-toss baseline, holdout", v.baseline_holdout);
-  md += "\n";
+  md += summary_row("Coin-toss side with the strategy's filters, walk-forward tests", v.filtered_baseline_out_of_sample);
+  md += summary_row("Coin-toss side with the strategy's filters, holdout", v.filtered_baseline_holdout);
+  md += "\nThe coin-toss baseline enters at random, on a random side, using nothing it reads from the market; "
+        "every exit rule is the same. The second baseline keeps the strategy's filters (volatility, toxicity) "
+        "and tosses a coin only for the side: if it does about as well as the strategy, the edge is in choosing "
+        "where and when to quote, not which side.\n\n";
 
   md += "## Overfitting\n\n";
   md += summary_header("Chosen settings");
@@ -713,10 +754,16 @@ struct Validation {
   for (std::size_t index = 0; index < v.reasons.size(); ++index) {
     json += (index ? ",\"" : "\"") + json_escape(v.reasons[index]) + "\"";
   }
+  json += "],\"caveats\":[";
+  for (std::size_t index = 0; index < v.caveats.size(); ++index) {
+    json += (index ? ",\"" : "\"") + json_escape(v.caveats[index]) + "\"";
+  }
   json += "],\"out_of_sample\":" + summary_json(v.out_of_sample);
   json += ",\"holdout\":" + summary_json(v.holdout);
   json += ",\"baseline_out_of_sample\":" + summary_json(v.baseline_out_of_sample);
   json += ",\"baseline_holdout\":" + summary_json(v.baseline_holdout);
+  json += ",\"filtered_baseline_out_of_sample\":" + summary_json(v.filtered_baseline_out_of_sample);
+  json += ",\"filtered_baseline_holdout\":" + summary_json(v.filtered_baseline_holdout);
   json += ",\"in_sample\":" + summary_json(v.in_sample);
   json += ",\"baseline_gap_t\":" + format("%.4f", v.baseline_gap_t);
   json += ",\"mean_rank_correlation\":" + format("%.4f", v.mean_rank_correlation);

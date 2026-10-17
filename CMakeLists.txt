@@ -110,6 +110,9 @@ endif()
 if(LOB_BUILD_BACKTEST)
   lob_add_executable(hftbt backtest/hftbt.cpp)
   target_include_directories(hftbt PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+  # HFT Strategy trading live, on paper, through Gomer Trading's bot gateway.
+  lob_add_executable(hftbot backtest/hftbot.cpp)
+  target_include_directories(hftbot PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
 
 # --- Tests -------------------------------------------------------------------
@@ -153,7 +156,8 @@ if(LOB_BUILD_TESTS)
     tests/hft_test.cpp
     tests/backtest_market_test.cpp
     tests/backtest_sim_test.cpp
-    tests/backtest_strategy_test.cpp)
+    tests/backtest_strategy_test.cpp
+    tests/backtest_live_test.cpp)
   target_link_libraries(lob_tests PRIVATE GTest::gtest_main)
   target_include_directories(lob_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
   # Tests that read data files find them from here.
@@ -179,7 +183,7 @@ if(LOB_BUILD_TESTS)
   if(LOB_BUILD_BACKTEST)
     add_test(NAME Hftbt.ValidatesFromTheSettingsFile
       COMMAND $<TARGET_FILE:hftbt> validate --config ${CMAKE_CURRENT_SOURCE_DIR}/backtest/hft_strategy.ini
-        --set market.ticks_per_session=600 --set "market.symbols=AAPL, NVDA, TSLA" --set validation.sessions=6
+        --set market.ticks_per_session=600 --set "market.symbols=F, SOFI, INTC" --set validation.sessions=6
         --set validation.train_sessions=2
         --set validation.test_sessions=2 --set validation.holdout_sessions=2
         --set "validation.grid=strategy.enter_score=0.3|0.8"

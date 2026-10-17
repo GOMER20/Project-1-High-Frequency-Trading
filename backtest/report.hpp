@@ -158,13 +158,20 @@ struct Summary {
   return buffer;
 }
 
+// The range the true success rate is likely in: "75-88%", or with a decimal
+// place when it is narrow enough to need one, "84.6-85.1%".
+[[nodiscard]] inline std::string success_range_text(const Summary& summary) {
+  const auto [low, high] = summary.success_range();
+  const char* pattern = (high - low) * 100 < 2 ? "%.1f" : "%.0f";
+  return format(pattern, low * 100) + "-" + format(pattern, high * 100) + "%";
+}
+
 // The standard block of lines, success rate first.
 [[nodiscard]] inline std::string summary_lines(const Summary& summary, const std::string& indent = "") {
-  const auto [low, high] = summary.success_range();
   std::string text;
   text += indent + "Success rate:     " + success_text(summary);
   if (summary.trades > 0) {
-    text += format(", likely %.0f", low * 100) + format("-%.0f%%", high * 100);
+    text += ", likely " + success_range_text(summary);
   }
   text += "\n";
   text += indent + "Net profit:       " + money(summary.net) + "\n";
